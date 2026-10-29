@@ -1,0 +1,102 @@
+name: Build Lineage GSI (Mesh Storage)
+
+on:
+  workflow_dispatch:
+    inputs:
+      role:
+        description: 'Runner Role'
+        required: true
+        default: 'master'
+        type: choice
+        options:
+          - master
+          - worker
+
+jobs:
+  mesh-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }} # Get from Tailscale admin
+
+    steps:
+      - name: Maximize Local Space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker rmi $(docker images -aq) -f || true
+          sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+
+      - name: Install Mesh Tools
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo apt-get update && sudo apt-get install -y sshfs fuse
+
+      - name: Join Mesh Network
+        run: |
+          sudo tailscale up --authkey=$TAILSCALE_AUTHKEY --hostname=ci-${{ github.run_id }}-${{ matrix.runner }}
+          echo "IP: $(tailscale ip -4)"
+
+      # --- WORKER LOGIC: Export Disk ---
+      - name: Worker - Export Storage
+        if: ${{ github.event.inputs.role == 'worker' }}
+        run: |
+          mkdir -p /mnt/export
+          # Create a sparse file to simulate extra space if needed, or just use root
+          dd if=/dev/zero of=/mnt/export/disk.img bs=1M count=50000 status=none # 50GB file
+          mkfs.ext4 /mnt/export/disk.img
+          mkdir -p /mnt/shared
+          sudo mount -o loop /mnt/export/disk.img /mnt/shared
+          
+          # Setup SSH for master to mount
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/id_rsa
+          chmod 600 /tmp/id_rsa
+          # Start SSH server (usually pre-installed on ubuntu-latest, ensure it runs)
+          sudo service ssh start
+          
+          echo "Worker ready. IP: $(tailscale ip -4)"
+          # Keep alive
+          sleep 3600
+
+      # --- MASTER LOGIC: Mount & Build ---
+      - name: Master - Mount Remote Disks
+        if: ${{ github.event.inputs.role == 'master' }}
+        run: |
+          mkdir -p /mnt/cluster
+          # Wait for workers to come online (simple poll)
+          sleep 30 
+          
+          # Discover peers (hardcoded count for simplicity, or use tailscale status)
+          PEERS=$(tailscale status --json | jq -r '.Peer[].DNSName' | head -n 4)
+          
+          i=0
+          for peer in $PEERS; do
+            mkdir -p /mnt/cluster/node$i
+            # Mount remote disk via SSHFS
+            sshfs -o StrictHostKeyChecking=no -i /tmp/id_rsa root@$peer:/mnt/shared /mnt/cluster/node$i
+            echo "Mounted $peer to /mnt/cluster/node$i"
+            ((i++))
+          done
+          
+          df -h /mnt/cluster
+
+      - name: Master - Setup Build Environment
+        if: ${{ github.event.inputs.role == 'master' }}
+        run: |
+          # Symlink Android OUT dir to the distributed storage
+          mkdir -p /mnt/cluster/node0/android_out
+          ln -s /mnt/cluster/node0/android_out $HOME/android/out
+          
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-dev libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 repo
+
+      - name: Master - Repo Sync & Build
+        if: ${{ github.event.inputs.role == 'master' }}
+        run: |
+          mkdir -p $HOME/android && cd $HOME/android
+          repo init -u https://github.com/LineageOS/android.git -b lineage-20.0 --depth=1
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+          
+          source build/envsetup.sh
+          lunch treble_arm64_avN-userdebug
+          
+          # Build. IO will hit the network mounts.
+          make systemimage -j$(nproc --all)
